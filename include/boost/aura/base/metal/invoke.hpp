@@ -1,0 +1,112 @@
+#pragma once
+
+#include <boost/aura/base/base_mesh_bundle.hpp>
+#include <boost/aura/base/metal/feed.hpp>
+#include <boost/aura/base/metal/kernel.hpp>
+#include <boost/aura/base/metal/safecall.hpp>
+#include <boost/aura/meta/tsizeof.hpp>
+
+#import <Metal/Metal.h>
+
+#if ! __has_feature(objc_arc)
+#error This file must be compiled with ARC. Either turn on ARC for the project or use -fobjc-arc flag
+#endif
+
+namespace boost
+{
+namespace aura
+{
+namespace base_detail
+{
+namespace metal
+{
+
+typedef id<MTLBuffer> arg_t;
+template <unsigned long N>
+using args_tt = std::array<arg_t, N>;
+
+// Alias for returned packed arguments.
+template <int N>
+using args_t = args_tt<N>;
+
+/// Copy arguments to memory block recursively.
+template <typename T0>
+void fill_args_(args_tt<0>::iterator it, const T0 a0)
+{
+        *it = a0.device_buffer;
+}
+
+template <typename T0, typename... Targs>
+void fill_args_(args_tt<0>::iterator it, const T0 a0, const Targs... ar)
+{
+        *it = a0.device_buffer;
+        fill_args_(++it, ar...);
+}
+
+/// Pack arguments.
+template <typename... Targs>
+args_t<sizeof...(Targs)> args_impl(const Targs... ar)
+{
+        args_tt<sizeof...(Targs)> pa;
+        fill_args_(pa.begin(), ar...);
+        return pa;
+}
+
+namespace detail
+{
+
+template <unsigned long N, typename MeshType, typename BundleType>
+inline void invoke_impl(kernel& k, const MeshType& m, const BundleType& b,
+        const args_t<N>&& a, feed& f)
+{
+    // Only Cocoa main thread / GCD threads have autorelease pools in place by default.
+    @autoreleasepool {
+        // Metal base expects mesh size to be not the overal number of threads.
+        auto mesh_bundle = adjust_mesh_bundle(m, b, mesh_bundle_operation::divide);
+        command_buffer& cmdb = f.get_command_buffer();
+        AURA_METAL_CHECK_ERROR(cmdb.command_buffer);
+
+        id<MTLComputePipelineState> pstate = [f.get_device().get_base_device()
+                newComputePipelineStateWithFunction:k.get_base_kernel()
+                                              error:nil];
+
+        AURA_METAL_CHECK_ERROR(pstate);
+
+        id<MTLComputeCommandEncoder> enc =
+                [cmdb.command_buffer computeCommandEncoder];
+
+        AURA_METAL_CHECK_ERROR(enc);
+
+        [enc setComputePipelineState:pstate];
+
+        // Set parameters.
+        for (std::size_t i = 0; i < a.size(); i++)
+        {
+                [enc setBuffer:a[i] offset:0 atIndex:i];
+        }
+
+#if AURA_DEBUG_MESH_BUNDLE
+        std::cout << mesh_bundle.first[0] << " " << mesh_bundle.first[1] << " "
+                  << mesh_bundle.first[2] << " " << mesh_bundle.second[0] << " "
+                  << mesh_bundle.second[1] << " " << mesh_bundle.second[2]
+                  << std::endl;
+#endif
+
+        MTLSize threadGroups = MTLSizeMake(mesh_bundle.first[0],
+                mesh_bundle.first[1], mesh_bundle.first[2]);
+        MTLSize threadsPerGroup = MTLSizeMake(mesh_bundle.second[0],
+                mesh_bundle.second[1], mesh_bundle.second[2]);
+        [enc dispatchThreadgroups:threadGroups
+                threadsPerThreadgroup:threadsPerGroup];
+        [enc endEncoding];
+        [cmdb.command_buffer commit];
+    }
+}
+
+
+} // namespace detail
+
+} // metal
+} // base_detail
+} // aura
+} // boost
